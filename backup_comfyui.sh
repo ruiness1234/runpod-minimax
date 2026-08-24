@@ -25,6 +25,7 @@
 #   - 巨大なキャッシュ・一時ファイル
 #
 # バックアップ先: /workspace/backup/comfyui_snapshot_YYYYMMDD_HHMMSS.tar.gz
+# 世代管理: 最新3世代のみ保持（古いものは確認なしで自動削除）
 # その後、RunPod のファイルブラウザや scp / rsync でローカルにダウンロード
 #
 # ============================================
@@ -37,6 +38,9 @@ COMFYUI_ROOT="/workspace/runpod-slim/ComfyUI"
 
 # バックアップ保存先
 BACKUP_DIR="/workspace/backup"
+
+# 保持するバックアップ世代数（これより古いものは自動削除）
+MAX_BACKUPS=3
 
 # タイムスタンプ
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -74,6 +78,7 @@ EXCLUDE_PATTERNS=(
 echo "===== ComfyUI 設定・ワークフロー バックアップ ====="
 echo "ComfyUI ルート: $COMFYUI_ROOT"
 echo "バックアップ先: $BACKUP_DIR"
+echo "保持世代数:     $MAX_BACKUPS"
 echo ""
 
 if [ ! -d "$COMFYUI_ROOT" ]; then
@@ -192,6 +197,7 @@ META_FILE="${SNAPSHOT_PATH}/BACKUP_INFO.txt"
   echo "Host: $(hostname 2>/dev/null || echo unknown)"
   echo "ComfyUI Root: $COMFYUI_ROOT"
   echo "Include output/: $INCLUDE_OUTPUT"
+  echo "Max backups kept: $MAX_BACKUPS"
   echo ""
   echo "Excluded patterns:"
   for pat in "${EXCLUDE_PATTERNS[@]}"; do
@@ -213,6 +219,23 @@ rm -rf "${SNAPSHOT_PATH}"
 
 ARCHIVE_SIZE=$(stat -c%s "${ARCHIVE_PATH}" 2>/dev/null || echo 0)
 HUMAN_SIZE=$(numfmt --to=iec-i --suffix=B "$ARCHIVE_SIZE" 2>/dev/null || echo "${ARCHIVE_SIZE} bytes")
+
+# 6. 世代管理：最新 MAX_BACKUPS 個だけ残し、古いものを確認なしで削除
+echo ""
+echo "----- 古いバックアップの整理（最大 ${MAX_BACKUPS} 世代） -----"
+mapfile -t BACKUP_LIST < <(ls -1t "${BACKUP_DIR}"/comfyui_snapshot_*.tar.gz 2>/dev/null || true)
+
+TOTAL=${#BACKUP_LIST[@]}
+if [ "$TOTAL" -gt "$MAX_BACKUPS" ]; then
+  for ((i=MAX_BACKUPS; i<TOTAL; i++)); do
+    OLD="${BACKUP_LIST[$i]}"
+    echo "[DELETE] $OLD"
+    rm -f "$OLD"
+  done
+  echo "→ $((TOTAL - MAX_BACKUPS)) 個の古いバックアップを削除しました"
+else
+  echo "→ 現在 ${TOTAL} 個（上限 ${MAX_BACKUPS} 以内のため削除なし）"
+fi
 
 echo ""
 echo "===== バックアップ完了 ====="
