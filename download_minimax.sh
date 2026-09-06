@@ -4,25 +4,21 @@
 # MiniMax H3 モデル自動ダウンロードスクリプト
 # PinkCherry beta-0.6 + 10Eros-Max beta2 対応版
 # 選択式・中断再開対応・大きい順ダウンロード
-# Storage → EU-RO-1(RTX PRO 4500) → Edit(Pod作成へ)
-# CPU → CPU 3GHz 2vCPUでDeploy
-# Web terminalをEnabledにし、ターミナルを開いてコマンド実行
-# ※動画生成時はGPU → ComfyUI13.0(Set overridesでContainer diskを20GBに、RTX PRO 4500でDeploy)
+# ゴミ掃除強化版（途中停止・Pod再起動対応）
 # ============================================
 #
 # 【RunPod Webターミナルでの実行方法】
 #
-# 初回・再開とも同じコマンド:
-#
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ruiness1234/runpod-minimax/main/download_minimax.sh)
 #
 # ※ 途中で Ctrl+C で止めても、同じコマンドを再実行すれば
-#    未完了ファイルは aria2c -c で続きから再開されます。
+#    未完了ファイルは aria2c -c で続きから再開できます。
 # ※ 完了済みファイルはサイズチェックでスキップされます。
 # ※ 共通ファイル（Text Encoder + VAE）は常にダウンロードされます。
 # ※ 片方のみ選択時、選んでいない方の Diffusion Model は
-#    途中ファイル含め削除されます。
+#    途中ファイル含め徹底削除されます。
 # ※ ダウンロードはサイズの大きい順に実行します。
+# ※ 不完全ファイルがある場合「再開」か「削除して最初から」を選べます。
 #
 # ============================================
 
@@ -70,23 +66,27 @@ EROS=(
 )
 
 DOWNLOADS=()
+KEEP_DIFFUSION=()   # 残す diffusion モデル名
 REMOVE_FILES=()
 
 case $CHOICE in
   1)
     DOWNLOADS=("${PINKCHERRY[@]}" "${COMMON_FILES[@]}")
+    KEEP_DIFFUSION=("$PINKCHERRY_NAME")
     REMOVE_FILES=("$EROS_NAME")
     echo "→ PinkCherry のみ + 共通ファイル（目安: 70GB以上）"
     echo "→ 存在する場合は 10Eros-Max 関連ファイルを削除します"
     ;;
   2)
     DOWNLOADS=("${EROS[@]}" "${COMMON_FILES[@]}")
+    KEEP_DIFFUSION=("$EROS_NAME")
     REMOVE_FILES=("$PINKCHERRY_NAME")
     echo "→ 10Eros-Max のみ + 共通ファイル（目安: 75GB以上）"
     echo "→ 存在する場合は PinkCherry 関連ファイルを削除します"
     ;;
   3)
     DOWNLOADS=("${PINKCHERRY[@]}" "${EROS[@]}" "${COMMON_FILES[@]}")
+    KEEP_DIFFUSION=("$PINKCHERRY_NAME" "$EROS_NAME")
     REMOVE_FILES=()
     echo "→ 両方 + 共通ファイル（目安: 110GB以上）"
     ;;
@@ -104,7 +104,7 @@ if [ ${#DOWNLOADS[@]} -gt 0 ]; then
     echo "→ ダウンロード順: サイズの大きい順"
 fi
 
-echo "選択完了。この後は完了まで自動で進みます。"
+echo "選択完了。"
 echo ""
 
 # ========== ここからノンストップ ==========
@@ -120,17 +120,22 @@ fi
 
 mkdir -p "$BASE_DIR"/{text_encoders,vae,diffusion_models,loras}
 
-# 選んでいない方のファイルを削除（本体 + aria2 一時ファイル）
-remove_unwanted() {
-    local name="$1"
-    local dir="$BASE_DIR/diffusion_models"
-    local removed=0
+# ---------- ユーティリティ ----------
+human_size() {
+    numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "${1} bytes"
+}
 
+# 指定パスの本体 + 関連一時ファイルをすべて削除
+clean_related() {
+    local path="$1"
+    local removed=0
     for f in \
-        "$dir/$name" \
-        "$dir/$name.aria2" \
-        "$dir/$name.tmp" \
-        "$dir/$name.part"
+        "$path" \
+        "${path}.aria2" \
+        "${path}.tmp" \
+        "${path}.part" \
+        "${path}.aria2.tmp" \
+        "${path}."*
     do
         if [ -e "$f" ]; then
             echo "[DELETE] $f"
@@ -138,31 +143,187 @@ remove_unwanted() {
             removed=1
         fi
     done
+    return $removed
+}
 
+# 不要な Diffusion Model を徹底削除（本体 + 一時 + 名前が似た残骸）
+remove_unwanted_diffusion() {
+    local dir="$BASE_DIR/diffusion_models"
+    echo "----- 不要モデル / ゴミの削除 (diffusion_models) -----"
+
+    # 明示的に削除対象のもの
+    for name in "${REMOVE_FILES[@]}"; do
+        clean_related "$dir/$name" || true
+    done
+
+    # KEEP 以外の大きなファイル・一時ファイルを掃除
     shopt -s nullglob
-    for f in "$dir/$name".*; do
-        if [ -e "$f" ]; then
-            echo "[DELETE] $f"
+    for f in "$dir"/*; do
+        [ -e "$f" ] || continue
+        local base=$(basename "$f")
+        local keep=0
+        for k in "${KEEP_DIFFUSION[@]}"; do
+            if [[ "$base" == "$k" || "$base" == "$k".* ]]; then
+                keep=1
+                break
+            fi
+        done
+        if [ "$keep" -eq 0 ]; then
+            echo "[DELETE] 不要/ゴミ: $f"
             rm -f "$f"
-            removed=1
+        fi
+    done
+    shopt -u nullglob
+    echo ""
+}
+
+# 共通ファイル用の一時ファイル掃除（完了済みなら .aria2 などを消す）
+clean_temps_for_expected() {
+    local subdir="$1"
+    local filename="$2"
+    local min_size="$3"
+    local path="$BASE_DIR/$subdir/$filename"
+
+    if [ -f "$path" ]; then
+        local size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+        local threshold=$(( min_size * 95 / 100 ))
+        if [ "$size" -ge "$threshold" ] && [ "$size" -gt 1000000 ]; then
+            # 完了済み → 一時ファイルだけ消す
+            for t in "${path}.aria2" "${path}.tmp" "${path}.part"; do
+                if [ -e "$t" ]; then
+                    echo "[CLEAN] 完了済みの一時ファイル削除: $t"
+                    rm -f "$t"
+                fi
+            done
+        fi
+    fi
+}
+
+# ---------- ディスク状況表示 ----------
+show_disk_info() {
+    echo "----- ディスク状況 -----"
+    if command -v df >/dev/null; then
+        df -h "$BASE_DIR" 2>/dev/null || df -h /workspace 2>/dev/null || true
+    fi
+    echo "BASE_DIR 使用量:"
+    du -sh "$BASE_DIR" 2>/dev/null || true
+    echo ""
+}
+
+# ---------- 不完全ファイル検出 ----------
+find_incomplete() {
+    local has_incomplete=0
+    echo "----- 不完全ファイル / 一時ファイルの確認 -----"
+
+    for item in "${DOWNLOADS[@]}"; do
+        IFS='|' read -r _u subdir filename minsize <<< "$item"
+        local path="$BASE_DIR/$subdir/$filename"
+        local size=0
+        if [ -f "$path" ]; then
+            size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+        fi
+        local threshold=$(( minsize * 95 / 100 ))
+
+        if [ -f "$path" ] && [ "$size" -lt "$threshold" ]; then
+            echo "[INCOMPLETE] $subdir/$filename ($(human_size $size) / 目安 $(human_size $minsize))"
+            has_incomplete=1
+        fi
+
+        # 一時ファイルだけの存在もチェック
+        for t in "${path}.aria2" "${path}.tmp" "${path}.part"; do
+            if [ -e "$t" ]; then
+                echo "[TEMP] $t"
+                has_incomplete=1
+            fi
+        done
+    done
+
+    # diffusion_models 内の予期しない大きなファイルも報告
+    shopt -s nullglob
+    for f in "$BASE_DIR/diffusion_models"/*; do
+        [ -f "$f" ] || continue
+        local base=$(basename "$f")
+        local keep=0
+        for k in "${KEEP_DIFFUSION[@]}"; do
+            if [[ "$base" == "$k" || "$base" == "$k".* ]]; then
+                keep=1
+                break
+            fi
+        done
+        if [ "$keep" -eq 0 ]; then
+            local sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -gt 100000000 ]; then  # 100MB超
+                echo "[GARBAGE] $f ($(human_size $sz))"
+                has_incomplete=1
+            fi
         fi
     done
     shopt -u nullglob
 
-    if [ "$removed" -eq 0 ]; then
-        echo "[INFO] 削除対象なし: $name"
+    if [ "$has_incomplete" -eq 0 ]; then
+        echo "不完全ファイル・大きなゴミは見つかりませんでした。"
     fi
+    echo ""
+    return $has_incomplete
 }
 
-if [ ${#REMOVE_FILES[@]} -gt 0 ]; then
-    echo "----- 不要モデルの削除 -----"
-    for name in "${REMOVE_FILES[@]}"; do
-        remove_unwanted "$name"
-    done
+# ---------- 実行フロー ----------
+show_disk_info
+
+# 不要モデルを先に削除
+remove_unwanted_diffusion
+
+# 共通ファイルの完了済み一時ファイル掃除
+for item in "${COMMON_FILES[@]}"; do
+    IFS='|' read -r _u subdir filename minsize <<< "$item"
+    clean_temps_for_expected "$subdir" "$filename" "$minsize"
+done
+
+# 不完全ファイルがあるか確認し、ユーザーに選択させる
+if find_incomplete; then
+    echo "不完全ファイルまたはゴミが検出されました。"
+    echo "  r) 再開する（既存の不完全ファイルを活かして続きからダウンロード）"
+    echo "  c) ゴミをすべて削除して最初からダウンロードし直す"
+    echo "  q) 終了"
+    read -p "選択 (r/c/q): " ACTION
     echo ""
+
+    case $ACTION in
+        c|C)
+            echo "----- 不完全ファイルを削除してクリーンな状態にします -----"
+            for item in "${DOWNLOADS[@]}"; do
+                IFS='|' read -r _u subdir filename minsize <<< "$item"
+                local path="$BASE_DIR/$subdir/$filename"
+                # 不完全なものだけ消す（完了済みは残す）
+                if [ -f "$path" ]; then
+                    local size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+                    local threshold=$(( minsize * 95 / 100 ))
+                    if [ "$size" -lt "$threshold" ]; then
+                        clean_related "$path" || true
+                    else
+                        # 完了済みなら一時ファイルだけ
+                        clean_temps_for_expected "$subdir" "$filename" "$minsize"
+                    fi
+                else
+                    clean_related "$path" || true
+                fi
+            done
+            # 再度不要ファイル掃除
+            remove_unwanted_diffusion
+            echo "クリーンアップ完了。"
+            show_disk_info
+            ;;
+        q|Q)
+            echo "終了します。"
+            exit 0
+            ;;
+        *)
+            echo "→ 再開モードで続行します。"
+            ;;
+    esac
 fi
 
-# 完成サイズ以上ならスキップ / 未完成なら aria2c -c で再開
+# ========== ダウンロード関数 ==========
 download_file() {
     local url="$1"
     local subdir="$2"
@@ -180,12 +341,16 @@ download_file() {
 
     local threshold=$(( min_complete_size * 95 / 100 ))
     if [ "$current_size" -ge "$threshold" ] && [ "$current_size" -gt 1000000 ]; then
-        echo "[SKIP] 既に完了: $filename ($(numfmt --to=iec-i --suffix=B $current_size 2>/dev/null || echo ${current_size} bytes))"
+        echo "[SKIP] 既に完了: $filename ($(human_size $current_size))"
+        # 完了済みなら一時ファイルを掃除
+        for t in "${dest_path}.aria2" "${dest_path}.tmp" "${dest_path}.part"; do
+            [ -e "$t" ] && rm -f "$t" && echo "[CLEAN] $t"
+        done
         return 0
     fi
 
     if [ "$current_size" -gt 0 ]; then
-        echo "[RESUME] 未完了を検出。続きから再開: $filename ($(numfmt --to=iec-i --suffix=B $current_size 2>/dev/null || echo ${current_size} bytes))"
+        echo "[RESUME] 未完了を検出。続きから再開: $filename ($(human_size $current_size))"
     else
         echo "[DOWNLOAD] $filename を開始..."
     fi
@@ -210,6 +375,10 @@ download_file() {
             -o "$filename" \
             "$url"; then
             echo "[SUCCESS] $filename ダウンロード完了"
+            # 成功後も念のため一時ファイル掃除
+            for t in "${dest_path}.aria2" "${dest_path}.tmp" "${dest_path}.part"; do
+                [ -e "$t" ] && rm -f "$t"
+            done
             break
         else
             echo "[WARN] $filename 一時失敗。${RETRY_WAIT}秒後に再開します..."
@@ -221,7 +390,7 @@ download_file() {
 echo "----- ダウンロード順（大きい順） -----"
 for item in "${DOWNLOADS[@]}"; do
     IFS='|' read -r _u _s fname fsize <<< "$item"
-    echo "  - $fname ($(numfmt --to=iec-i --suffix=B $fsize 2>/dev/null || echo $fsize bytes))"
+    echo "  - $fname ($(human_size $fsize))"
 done
 echo ""
 
@@ -236,3 +405,4 @@ echo "保存先: $BASE_DIR"
 echo "  - diffusion_models/"
 echo "  - text_encoders/"
 echo "  - vae/"
+show_disk_info
