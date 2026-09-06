@@ -5,6 +5,10 @@
 # PinkCherry beta-0.6 + 10Eros-Max beta2 対応版
 # 選択式・中断再開対応・大きい順ダウンロード
 # ゴミ掃除強化版（途中停止・Pod再起動対応）
+# Storage → EU-RO-1(RTX PRO 4500) → Edit(Pod作成へ)
+# CPU → CPU 3GHz 2vCPUでDeploy
+# Web terminalをEnabledにし、ターミナルを開いてコマンド実行
+# ※動画生成時はGPU → ComfyUI13.0(Set overridesでContainer diskを20GBに、RTX PRO 4500でDeploy)
 # ============================================
 #
 # 【RunPod Webターミナルでの実行方法】
