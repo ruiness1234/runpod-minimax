@@ -6,6 +6,7 @@
 # 選択式・中断再開対応・大きい順ダウンロード
 # Storage → EU-RO-1(RTX PRO 4500) → Edit(Pod作成へ)
 # GPU → ComfyUI13.0(Set overridesでContainer diskを20GBに、RTX PRO 4500でDeploy)
+# Web terminalをEnabledにし、ターミナルを開いてコマンド実行
 # ============================================
 #
 # 【RunPod Webターミナルでの実行方法】
