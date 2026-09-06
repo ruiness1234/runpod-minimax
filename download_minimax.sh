@@ -7,6 +7,11 @@
 # ・不完全/破損ファイル検出＋再開/強制再DL対応
 # ・local スコープ修正
 # ============================================
+# Storage → EU-RO-1(RTX PRO 4500) → Edit(Pod作成へ)
+# CPU → CPU 3GHz 2vCPUでDeploy
+# Web terminalをEnabledにし、ターミナルを開いてコマンド実行
+# ※動画生成時はGPU → ComfyUI13.0(Set overridesでContainer diskを20GBに、RTX PRO 4500でDeploy)
+# ============================================
 #
 # 実行方法（RunPod Webターミナル）:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ruiness1234/runpod-minimax/main/download_minimax.sh)
