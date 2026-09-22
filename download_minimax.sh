@@ -2,7 +2,7 @@
 
 # ============================================
 # MiniMax H3 モデル自動ダウンロードスクリプト（修正強化版）
-# PinkCherry beta-0.6 + 10Eros-Max beta2 対応
+# PinkCherry beta-0.6 + PinkCherry v1_final (community turbo+pruned+int8) 対応
 # ・厳格サイズチェック
 # ・不完全/破損ファイル検出＋再開/強制再DL対応
 # ・local スコープ修正
@@ -25,6 +25,7 @@ set -euo pipefail
 # ========== 設定 ==========
 BASE_DIR="/workspace/runpod-slim/ComfyUI/models"
 HF_TOKEN=""                            # 必要ならトークンを入れる
+CIVITAI_TOKEN=""                       # Civitaiダウンロード用（必要なら入れる）
 
 CONNECTIONS=16
 MAX_TRIES=0
@@ -37,9 +38,9 @@ echo "（共通ファイル: Text Encoder + VAE は常にダウンロード）"
 echo ""
 echo "ダウンロードする Diffusion Model を選択してください："
 echo ""
-echo "  1) PinkCherry beta-0.6 int8 のみ     … ネットワークドライブ 70GB以上"
-echo "  2) 10Eros-Max fl2va beta2 pruned のみ … ネットワークドライブ 75GB以上"
-echo "  3) 両方                               … ネットワークドライブ 110GB以上"
+echo "  1) PinkCherry beta-0.6 int8 のみ                    … ネットワークドライブ 70GB以上"
+echo "  2) PinkCherry v1_final (turbo+pruned+int8 community) のみ … ネットワークドライブ 55GB以上"
+echo "  3) 両方                                             … ネットワークドライブ 95GB以上"
 echo ""
 read -p "番号を入力 (1-3): " CHOICE
 echo ""
@@ -51,15 +52,17 @@ COMMON_FILES=(
   "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors|vae|minimax_h3_audio_vae_fp32.safetensors|600000000"
 )
 
-PINKCHERRY_NAME="PinkCherry_fl2va_MiniMax_H3_int8_convrot-beta-0.6.safetensors"
-EROS_NAME="10Eros_Max_h3_fl2va_beta2_pruned.safetensors"
+PINKCHERRY_BETA_NAME="PinkCherry_fl2va_MiniMax_H3_int8_convrot-beta-0.6.safetensors"
+PINKCHERRY_V1_NAME="PinkCherry_v1_bf16_fla2va_H3_TURBO_v3_int8_convrot_pruned.safetensors"
 
-PINKCHERRY=(
-  "https://huggingface.co/SexGod1979/PinkCherry_MiniMax-H3/resolve/main/beta-0.6-fl2va/${PINKCHERRY_NAME}|diffusion_models|${PINKCHERRY_NAME}|34000000000"
+PINKCHERRY_BETA=(
+  "https://huggingface.co/SexGod1979/PinkCherry_MiniMax-H3/resolve/main/beta-0.6-fl2va/${PINKCHERRY_BETA_NAME}|diffusion_models|${PINKCHERRY_BETA_NAME}|34000000000"
 )
 
-EROS=(
-  "https://huggingface.co/TenStrip/10Eros-Max/resolve/main/${EROS_NAME}|diffusion_models|${EROS_NAME}|40000000000"
+# コミュニティ製 v1_final (extraltodeus / Civitai modelVersion 3326433)
+# Civitaiはトークン必須の場合があるため、CIVITAI_TOKEN を設定推奨
+PINKCHERRY_V1=(
+  "https://civitai.com/api/download/models/3326433|diffusion_models|${PINKCHERRY_V1_NAME}|19500000000"
 )
 
 DOWNLOADS=()
@@ -67,21 +70,21 @@ REMOVE_FILES=()
 
 case $CHOICE in
   1)
-    DOWNLOADS=("${PINKCHERRY[@]}" "${COMMON_FILES[@]}")
-    REMOVE_FILES=("$EROS_NAME")
-    echo "→ PinkCherry のみ + 共通ファイル（目安: 70GB以上）"
-    echo "→ 存在する場合は 10Eros-Max 関連ファイルを削除します"
+    DOWNLOADS=("${PINKCHERRY_BETA[@]}" "${COMMON_FILES[@]}")
+    REMOVE_FILES=("$PINKCHERRY_V1_NAME")
+    echo "→ PinkCherry beta-0.6 のみ + 共通ファイル（目安: 70GB以上）"
+    echo "→ 存在する場合は PinkCherry v1_final 関連ファイルを削除します"
     ;;
   2)
-    DOWNLOADS=("${EROS[@]}" "${COMMON_FILES[@]}")
-    REMOVE_FILES=("$PINKCHERRY_NAME")
-    echo "→ 10Eros-Max のみ + 共通ファイル（目安: 75GB以上）"
-    echo "→ 存在する場合は PinkCherry 関連ファイルを削除します"
+    DOWNLOADS=("${PINKCHERRY_V1[@]}" "${COMMON_FILES[@]}")
+    REMOVE_FILES=("$PINKCHERRY_BETA_NAME")
+    echo "→ PinkCherry v1_final (community turbo+pruned+int8) のみ + 共通ファイル（目安: 55GB以上）"
+    echo "→ 存在する場合は PinkCherry beta-0.6 関連ファイルを削除します"
     ;;
   3)
-    DOWNLOADS=("${PINKCHERRY[@]}" "${EROS[@]}" "${COMMON_FILES[@]}")
+    DOWNLOADS=("${PINKCHERRY_BETA[@]}" "${PINKCHERRY_V1[@]}" "${COMMON_FILES[@]}")
     REMOVE_FILES=()
-    echo "→ 両方 + 共通ファイル（目安: 110GB以上）"
+    echo "→ 両方 + 共通ファイル（目安: 95GB以上）"
     ;;
   *)
     echo "無効な選択です。終了します。"
@@ -264,6 +267,7 @@ download_file() {
   local current_size=0
   local threshold
   local header_opt=""
+  local final_url="$url"
 
   mkdir -p "$dest_dir"
 
@@ -281,8 +285,22 @@ download_file() {
     echo "[DOWNLOAD] $filename を開始..."
   fi
 
-  if [ -n "$HF_TOKEN" ]; then
+  # Hugging Face / Civitai 認証
+  if [[ "$url" == *"huggingface.co"* ]] && [ -n "$HF_TOKEN" ]; then
     header_opt="--header=Authorization: Bearer $HF_TOKEN"
+  elif [[ "$url" == *"civitai.com"* ]]; then
+    if [ -n "$CIVITAI_TOKEN" ]; then
+      # クエリに token を付与（Civitai推奨）
+      if [[ "$url" == *"?"* ]]; then
+        final_url="${url}&token=${CIVITAI_TOKEN}"
+      else
+        final_url="${url}?token=${CIVITAI_TOKEN}"
+      fi
+      header_opt="--header=Authorization: Bearer $CIVITAI_TOKEN"
+    else
+      echo "[WARN] Civitai ダウンロードです。CIVITAI_TOKEN が未設定のため認証エラーになる可能性があります。"
+      echo "      スクリプト上部の CIVITAI_TOKEN に API キーを設定してください。"
+    fi
   fi
 
   while true; do
@@ -298,7 +316,7 @@ download_file() {
       $header_opt \
       -d "$dest_dir" \
       -o "$filename" \
-      "$url"; then
+      "$final_url"; then
 
       # ダウンロード後の最終サイズチェック
       current_size=$(get_file_size "$dest_path")
@@ -401,3 +419,7 @@ echo "  - vae/"
 echo ""
 echo "※ CLIP shape エラーが出た場合は、特に text_encoders/qwen3vl_... が破損している可能性が高いです。"
 echo "  その場合は再度このスクリプトを実行し、選択肢で「f」を選んで強制再ダウンロードしてください。"
+echo ""
+echo "【補足】PinkCherry v1_final (community) は Civitai 経由です。"
+echo "  認証エラーになる場合はスクリプト上部の CIVITAI_TOKEN に API キーを設定してください。"
+echo "  （Civitai → Account Settings → API Keys で発行可能）"
