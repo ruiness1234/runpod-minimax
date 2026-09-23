@@ -25,7 +25,7 @@ set -euo pipefail
 # ========== 設定 ==========
 BASE_DIR="/workspace/runpod-slim/ComfyUI/models"
 HF_TOKEN=""                            # 必要ならトークンを入れる
-CIVITAI_TOKEN="4ebdfe6e72abdd1f9c721b4f0d0e085c"                       # Civitaiダウンロード用（必要なら入れる）
+CIVITAI_TOKEN=""                       # Civitaiダウンロード用（必要なら入れる）
 
 CONNECTIONS=16
 MAX_TRIES=0
