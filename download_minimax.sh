@@ -414,7 +414,7 @@ download_file() {
   local dest_path="$dest_dir/$filename"
   local current_size=0
   local threshold
-  local header_opt=""
+  local header_opts=()
   local final_url="$url"
   local aria_pid
   local aria_log
@@ -444,7 +444,7 @@ download_file() {
   fi
 
   if [[ "$url" == *"huggingface.co"* ]] && [ -n "$HF_TOKEN" ]; then
-    header_opt="--header=Authorization: Bearer $HF_TOKEN"
+    header_opts=(--header="Authorization: Bearer $HF_TOKEN")
   elif [[ "$url" == *"civitai.com"* ]]; then
     if [ -n "$CIVITAI_TOKEN" ]; then
       if [[ "$url" == *"?"* ]]; then
@@ -452,7 +452,7 @@ download_file() {
       else
         final_url="${url}?token=${CIVITAI_TOKEN}"
       fi
-      header_opt="--header=Authorization: Bearer $CIVITAI_TOKEN"
+      header_opts=(--header="Authorization: Bearer $CIVITAI_TOKEN")
     else
       echo "[WARN] Civitai ダウンロードです。CIVITAI_TOKEN が未設定の可能性があります。"
     fi
@@ -475,7 +475,7 @@ download_file() {
       --summary-interval=0 \
       --download-result=hide \
       --quiet=true \
-      $header_opt \
+      "${header_opts[@]}" \
       -d "$dest_dir" \
       -o "$filename" \
       "$final_url" \
