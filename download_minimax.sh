@@ -7,6 +7,8 @@
 # ・不完全/破損ファイル検出＋再開/強制再DL対応
 # ・local スコープ修正
 # ・aria2c 詳細ログ抑制 + 全体進捗サマリー + 目安残り時間
+# ・モデル選択後の空き容量チェック（不足時は続行/終了を選択可）
+# ・完了判定しきい値の統一、恒久失敗時の無限リトライ防止、トークンのログ伏字化
 # ============================================
 # Runpod動作環境
 # Storage → EU-RO-1(RTX PRO 4500) → Edit(Pod作成へ)
@@ -29,9 +31,13 @@ HF_TOKEN=""                            # 必要ならトークンを入れる
 CIVITAI_TOKEN=""                       # Civitaiダウンロード用（対話入力でも可）
 
 CONNECTIONS=16
-MAX_TRIES=0
+MAX_TRIES=5                            # aria2c 1回あたりの内部リトライ上限（0=無限だと下のMAX_OUTER_RETRYが機能しないため有限値に変更）
 RETRY_WAIT=10
 PROGRESS_INTERVAL=2                    # サマリー更新間隔（秒）
+
+MAX_OUTER_RETRY=20                     # 恒久的なエラー（URL不正・トークン失効等）で無限ループしないための最大試行回数
+COMPLETE_THRESHOLD_PERCENT=98          # このサイズ％以上あれば「ダウンロード完了」とみなす（全チェック箇所で統一）
+DISK_SAFETY_MARGIN_GB=5                # 空き容量チェック時に確保しておく余裕（GB）
 # ==========================
 
 echo "===== MiniMax H3 自動ダウンロード（強化版） ====="
@@ -95,6 +101,32 @@ human_eta() {
   fi
 }
 
+# 配列に指定した要素が含まれているか確認する（不完全ファイル検出の重複登録防止に使用）
+array_contains() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 標準入力からトークン文字列を伏字にして出力する（ログ表示時のトークン漏洩防止）
+mask_secrets() {
+  local input
+  input=$(cat)
+  if [ -n "${CIVITAI_TOKEN:-}" ]; then
+    input="${input//$CIVITAI_TOKEN/[REDACTED]}"
+  fi
+  if [ -n "${HF_TOKEN:-}" ]; then
+    input="${input//$HF_TOKEN/[REDACTED]}"
+  fi
+  printf '%s\n' "$input"
+}
+
 remove_unwanted() {
   local name="$1"
   local dir="$BASE_DIR/diffusion_models"
@@ -150,7 +182,7 @@ detect_incomplete() {
     done
 
     current_size=$(get_file_size "$dest_path")
-    threshold=$(( minsize * 95 / 100 ))
+    threshold=$(( minsize * COMPLETE_THRESHOLD_PERCENT / 100 ))
 
     if [ "$current_size" -gt 0 ] && [ "$current_size" -lt "$threshold" ]; then
       echo "[INCOMPLETE] サイズ不足: $filename ($(human_size $current_size) < 目安 $(human_size $minsize))"
@@ -161,11 +193,13 @@ detect_incomplete() {
     fi
   done
 
+  # diffusion_models 配下に残っている「対象外の」一時ファイル（旧モデル等）も検出する
+  # 上のループで既に検出済みのものは二重登録しない
   if [ -d "$BASE_DIR/diffusion_models" ]; then
     shopt -s nullglob
     for f in "$BASE_DIR/diffusion_models"/*.{aria2,tmp,part}; do
-      if [ -e "$f" ]; then
-        echo "[GARBAGE] $f"
+      if [ -e "$f" ] && ! array_contains "$f" "${incomplete_list[@]}"; then
+        echo "[GARBAGE] 対象外の一時ファイルを検出: $f"
         incomplete_list+=("$f")
         incomplete_found=1
       fi
@@ -251,7 +285,7 @@ calc_bytes_done() {
     dest_path="$BASE_DIR/$subdir/$filename"
     sz=$(get_file_size "$dest_path")
     # 完了済みは minsize 相当として数え、途中は実サイズ
-    local th=$(( minsize * 98 / 100 ))
+    local th=$(( minsize * COMPLETE_THRESHOLD_PERCENT / 100 ))
     if [ "$sz" -ge "$th" ] && [ "$sz" -gt 1000000 ]; then
       total=$((total + minsize))
     else
@@ -259,6 +293,66 @@ calc_bytes_done() {
     fi
   done
   echo "$total"
+}
+
+# 選択したモデル一式に対して、空き容量が足りているか確認する
+# 不足している場合は警告を表示し、続行するか終了するかをユーザーに選ばせる
+check_disk_space() {
+  mkdir -p "$BASE_DIR"
+
+  local item fsize total_expected=0
+  for item in "${DOWNLOADS[@]}"; do
+    IFS='|' read -r _ _ _ fsize <<< "$item"
+    total_expected=$((total_expected + fsize))
+  done
+
+  local already_done required margin_bytes required_with_margin avail_bytes
+  already_done=$(calc_bytes_done)
+
+  required=$(( total_expected - already_done ))
+  if [ "$required" -lt 0 ]; then
+    required=0
+  fi
+
+  margin_bytes=$(( DISK_SAFETY_MARGIN_GB * 1024 * 1024 * 1024 ))
+  required_with_margin=$(( required + margin_bytes ))
+
+  avail_bytes=$(df --output=avail -B1 "$BASE_DIR" 2>/dev/null | tail -n 1 | tr -d ' ')
+
+  echo "----- 空き容量チェック -----"
+  if [ -z "$avail_bytes" ]; then
+    echo "[WARN] 空き容量を取得できませんでした。このチェックはスキップします。"
+    echo ""
+    return 0
+  fi
+
+  echo "  必要容量（残り分の概算）      : $(human_size "$required")"
+  echo "  安全マージン                  : $(human_size "$margin_bytes")"
+  echo "  現在の空き容量                : $(human_size "$avail_bytes")"
+
+  if [ "$avail_bytes" -lt "$required_with_margin" ]; then
+    echo ""
+    echo "[WARNING] 空き容量が不足している可能性があります。"
+    echo "  （必要容量 + マージン: $(human_size "$required_with_margin")  >  空き容量: $(human_size "$avail_bytes")）"
+    echo ""
+    echo "  このまま続行すると、ダウンロード途中でディスクフルになり失敗する可能性があります。"
+    echo ""
+    echo "  y) 承知のうえで続行する"
+    echo "  n) 終了する（ストレージ拡張や不要ファイル削除の後、再実行してください）"
+    read -p "選択 (y/n): " DISK_CONTINUE
+    case "$DISK_CONTINUE" in
+      y|Y)
+        echo "→ 空き容量不足を承知のうえで続行します。"
+        ;;
+      *)
+        echo "→ 空き容量不足のため終了します。"
+        exit 1
+        ;;
+    esac
+  else
+    echo "[OK] 空き容量は十分です。"
+  fi
+  echo ""
 }
 
 # 1行サマリー表示（上書き更新）
@@ -309,6 +403,8 @@ print_progress_line() {
 }
 
 # ダウンロード本体（aria2c は静音、進捗はサマリーのみ）
+# 恒久的エラー（URL不正・トークン失効など）で無限に回り続けないよう、
+# 外側ループの試行回数に上限（MAX_OUTER_RETRY）を設けている
 download_file() {
   local url="$1"
   local subdir="$2"
@@ -323,11 +419,12 @@ download_file() {
   local aria_pid
   local aria_log
   local exit_code=0
+  local attempt=0
 
   mkdir -p "$dest_dir"
 
   current_size=$(get_file_size "$dest_path")
-  threshold=$(( min_complete_size * 98 / 100 ))
+  threshold=$(( min_complete_size * COMPLETE_THRESHOLD_PERCENT / 100 ))
 
   if [ "$current_size" -ge "$threshold" ] && [ "$current_size" -gt 1000000 ]; then
     echo ""
@@ -362,6 +459,7 @@ download_file() {
   fi
 
   while true; do
+    attempt=$((attempt + 1))
     aria_log=$(mktemp /tmp/aria2_XXXXXX.log)
 
     # 詳細ログはファイルへ。ターミナルには出さない
@@ -410,30 +508,38 @@ download_file() {
     # 失敗またはサイズ不足
     echo ""
     if [ "$exit_code" -ne 0 ]; then
-      echo "[WARN] $filename 一時失敗 (exit=$exit_code)。${RETRY_WAIT}秒後に再試行..."
+      echo "[WARN] $filename の取得に失敗しました (exit=$exit_code) [試行 $attempt/$MAX_OUTER_RETRY]。${RETRY_WAIT}秒後に再試行します..."
       if [ -s "$aria_log" ]; then
-        echo "---- aria2c ログ末尾 ----"
-        tail -n 8 "$aria_log" || true
-        echo "------------------------"
+        echo "---- aria2c ログ末尾（トークンは伏字表示） ----"
+        mask_secrets < "$aria_log" | tail -n 8 || true
+        echo "-----------------------------------------------"
       fi
     else
-      echo "[WARN] ダウンロード後もサイズ不足: $filename ($(human_size $current_size))。再試行します..."
+      echo "[WARN] ダウンロード後もサイズが不足しています: $filename ($(human_size $current_size)) [試行 $attempt/$MAX_OUTER_RETRY]。再試行します..."
       rm -f "$dest_path" "${dest_path}.aria2" 2>/dev/null || true
     fi
     rm -f "$aria_log"
+
+    if [ "$attempt" -ge "$MAX_OUTER_RETRY" ]; then
+      echo ""
+      echo "[FATAL] $filename: ${MAX_OUTER_RETRY}回試行しましたが完了しませんでした。処理を中断します。"
+      echo "  URL・トークンの有効期限・ネットワーク状況をご確認のうえ、スクリプトを再実行してください。"
+      exit 1
+    fi
+
     sleep "$RETRY_WAIT"
   done
 }
 
 # ========== 対話フェーズ ==========
-# ① モデル選択 → ② トークン → ③ 不完全ファイル。②で「①に戻る」可
+# ① モデル選択 → 空き容量チェック → ② トークン → ③ 不完全ファイル。②で「①に戻る」可
 
 while true; do
   echo "【①】ダウンロードする Diffusion Model を選択してください："
   echo ""
-  echo "  1) PinkCherry beta-0.6 int8 のみ                    … ネットワークドライブ 70GB以上"
-  echo "  2) PinkCherry v1_final (turbo+pruned+int8 community) のみ … ネットワークドライブ 55GB以上"
-  echo "  3) 両方                                             … ネットワークドライブ 95GB以上"
+  echo "  1) PinkCherry beta-0.6 int8 のみ                            … 目安容量 70GB以上"
+  echo "  2) PinkCherry v1_final (turbo+pruned+int8 community) のみ   … 目安容量 55GB以上"
+  echo "  3) 両方                                                     … 目安容量 95GB以上"
   echo ""
   read -p "番号を入力 (1-3): " CHOICE
   echo ""
@@ -475,6 +581,9 @@ while true; do
   echo "選択完了。"
   echo ""
 
+  # 選択した内容をもとに、空き容量が足りているかここで確認する
+  check_disk_space
+
   if [ "$NEED_CIVITAI" -eq 0 ]; then
     break
   fi
@@ -510,7 +619,7 @@ while true; do
     fi
 
     echo ""
-    echo "  r) 再入力する"
+    echo "  r) トークンを再入力する"
     echo "  b) ①のモデル選択に戻る"
     echo "  q) 処理を終了する"
     read -p "選択 (r/b/q): " RETRY_CHOICE
@@ -552,11 +661,11 @@ detect_incomplete
 
 FORCE_REDOWNLOAD=0
 echo ""
-echo "不完全ファイルまたはゴミが検出された場合、または強制再ダウンロードしたい場合："
+echo "不完全ファイルやゴミが見つかった場合、または最初から強制的にやり直したい場合は、次から選んでください："
 echo "  r) 再開する（既存の不完全ファイルを活かして続きからダウンロード）"
-echo "  c) ゴミ・不完全ファイルだけ削除して最初からダウンロードし直す"
-echo "  f) 完了済みを含む「全対象ファイル」を削除して最初からダウンロードし直す ★推奨（破損対策）"
-echo "  q) 終了"
+echo "  c) 不完全ファイル・ゴミだけ削除して、最初からダウンロードし直す"
+echo "  f) 完了済みを含む「対象ファイル全て」を削除して、最初からダウンロードし直す ★破損が疑われる場合に推奨"
+echo "  q) 終了する"
 read -p "選択 (r/c/f/q): " ACTION
 echo ""
 
@@ -618,7 +727,7 @@ for item in "${DOWNLOADS[@]}"; do
 done
 echo ""
 echo "合計目安サイズ: $(human_size "$TOTAL_EXPECTED") / ファイル数: $FILES_TOTAL"
-echo "（進捗行は上書き更新。残り時間は開始後の平均速度からの目安です）"
+echo "（進捗行は上書き更新されます。残り時間は開始後の平均速度からの目安です）"
 echo ""
 
 SESSION_START=$(date +%s)
